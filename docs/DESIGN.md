@@ -155,8 +155,16 @@ Use an **entity-based approach**:
 - **Troll notifications** — optional chat message when someone gets pranked
 - **Statistics** — track how many items have been pranked
 
+## Known Limitations (v0.1)
+
+- **Block item icon** shows as oak planks, not a chest texture — needs custom icon PNG in `textures/items/` + `minecraft:icon` in block JSON
+- **No lid-open animation** — entity is static; animation requires animation controller wired to player-proximity query (v0.2)
+- **Container interaction** relies on Bedrock's native `minecraft:inventory` behavior — if chest screen doesn't open in some versions, may need `playerInteractWithEntity` handler workaround
+- **Visual "blink"** — block placeholder briefly visible before entity spawns
+
 ## Version History
 
 | Version | Status | Notes |
 |---------|--------|-------|
-| v0.1 | 🚧 In Progress | Basic structure, crafting recipe, core downgrade logic |
+| v0.1 | ✅ Done | Entity-based chest, all downgrade chains, per-slot timers, crafting recipe, persistence |
+| v0.2 | 🚧 Planned | Lid animation, proper block icon, container interaction fix |
