@@ -1,0 +1,17 @@
+{
+    "format_version": "1.10.0",
+    "minecraft:client_entity": {
+        "description": {
+            "identifier": "prankchest:prank_chest",
+            "textures": {
+                "default": "textures/entity/chest/normal"
+            },
+            "geometry": {
+                "default": "geometry.prank_chest"
+            },
+            "render_controllers": [
+                "controller.render.prank_chest"
+            ]
+        }
+    }
+}

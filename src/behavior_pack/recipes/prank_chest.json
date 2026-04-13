@@ -1,0 +1,22 @@
+{
+    "format_version": "1.17.41",
+    "minecraft:recipe_shaped": {
+        "description": {
+            "identifier": "prankchest:prank_chest"
+        },
+        "tags": ["crafting_table"],
+        "pattern": [
+            "###",
+            "#R#",
+            "###"
+        ],
+        "key": {
+            "#": { "tag": "minecraft:planks" },
+            "R": { "item": "minecraft:redstone" }
+        },
+        "result": {
+            "item": "prankchest:prank_chest",
+            "count": 1
+        }
+    }
+}

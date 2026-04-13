@@ -1,0 +1,40 @@
+{
+    "format_version": "1.21.0",
+    "minecraft:entity": {
+        "description": {
+            "identifier": "prankchest:prank_chest",
+            "is_spawnable": false,
+            "is_summonable": true,
+            "is_experimental": false
+        },
+        "components": {
+            "minecraft:collision_box": {
+                "width": 0.875,
+                "height": 0.875
+            },
+            "minecraft:health": {
+                "value": 30,
+                "max": 30
+            },
+            "minecraft:knockback_resistance": {
+                "value": 1.0
+            },
+            "minecraft:pushable": {
+                "is_pushable": false,
+                "is_pushable_by_piston": false
+            },
+            "minecraft:physics": {
+                "has_gravity": false,
+                "has_collision": true
+            },
+            "minecraft:inventory": {
+                "container_type": "chest",
+                "inventory_size": 27,
+                "can_be_siphoned_from": false
+            },
+            "minecraft:loot": {
+                "table": "loot_tables/entities/prank_chest.json"
+            }
+        }
+    }
+}
