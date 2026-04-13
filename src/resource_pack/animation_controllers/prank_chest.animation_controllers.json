@@ -1,0 +1,33 @@
+{
+    "format_version": "1.10.0",
+    "animation_controllers": {
+        "controller.animation.prank_chest.lid": {
+            "initial_state": "closed",
+            "states": {
+                "closed": {
+                    "transitions": [
+                        { "opening": "query.property('prankchest:is_open')" }
+                    ]
+                },
+                "opening": {
+                    "animations": ["open_lid"],
+                    "transitions": [
+                        { "open": "query.anim_time >= 0.2" }
+                    ]
+                },
+                "open": {
+                    "animations": ["hold_open"],
+                    "transitions": [
+                        { "closing": "!query.property('prankchest:is_open')" }
+                    ]
+                },
+                "closing": {
+                    "animations": ["close_lid"],
+                    "transitions": [
+                        { "closed": "query.anim_time >= 0.2" }
+                    ]
+                }
+            }
+        }
+    }
+}

@@ -10,7 +10,18 @@
                 "default": "textures/entity/chest/normal"
             },
             "geometry": {
-                "default": "geometry.prank_chest"
+                "default": "geometry.chest"
+            },
+            "animations": {
+                "open_lid":       "animation.prank_chest.open_lid",
+                "hold_open":      "animation.prank_chest.hold_open",
+                "close_lid":      "animation.prank_chest.close_lid",
+                "lid_controller": "controller.animation.prank_chest.lid"
+            },
+            "scripts": {
+                "animate": [
+                    "lid_controller"
+                ]
             },
             "render_controllers": [
                 "controller.render.prank_chest"

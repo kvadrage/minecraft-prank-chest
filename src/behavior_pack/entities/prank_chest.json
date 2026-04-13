@@ -5,7 +5,14 @@
             "identifier": "prankchest:prank_chest",
             "is_spawnable": false,
             "is_summonable": true,
-            "is_experimental": false
+            "is_experimental": false,
+            "properties": {
+                "prankchest:is_open": {
+                    "type": "bool",
+                    "default": false,
+                    "client_sync": true
+                }
+            }
         },
         "components": {
             "minecraft:collision_box": {
@@ -31,6 +38,22 @@
                 "container_type": "chest",
                 "inventory_size": 27,
                 "can_be_siphoned_from": false
+            },
+            "minecraft:interact": {
+                "interactions": [
+                    {
+                        "on_interact": {
+                            "filters": {
+                                "test": "is_family",
+                                "subject": "other",
+                                "value": "player"
+                            }
+                        },
+                        "interact_text": "action.interact.opencontainer",
+                        "use_item": false,
+                        "swing": false
+                    }
+                ]
             },
             "minecraft:loot": {
                 "table": "loot_tables/entities/prank_chest.json"

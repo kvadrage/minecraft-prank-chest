@@ -5,7 +5,14 @@
     "resource_pack_name": "prankchest",
     "texture_data": {
         "prank_chest": {
-            "textures": "textures/blocks/planks_oak"
+            "textures": {
+                "up": "textures/blocks/chest_top",
+                "down": "textures/blocks/chest_top",
+                "north": "textures/blocks/chest_front",
+                "south": "textures/blocks/chest_side",
+                "east": "textures/blocks/chest_side",
+                "west": "textures/blocks/chest_side"
+            }
         }
     }
 }

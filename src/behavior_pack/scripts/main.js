@@ -1,7 +1,13 @@
-// Prank Chest — Main Script  v0.1.0
+// Prank Chest — Main Script  v0.1.1
 // Entity-based approach: prank_chest entity owns inventory; script manages timers.
 
-import { world, system, BlockPermutation, ItemStack } from "@minecraft/server";
+import {
+    world,
+    system,
+    BlockPermutation,
+    ItemStack,
+    GameMode,
+} from "@minecraft/server";
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -18,7 +24,6 @@ const ORE_DOWNGRADES = {
     "minecraft:iron_ore":               "minecraft:copper_ore",
     "minecraft:copper_ore":             "minecraft:gold_ore",
     "minecraft:nether_gold_ore":        "minecraft:dirt",
-    // Deepslate variants
     "minecraft:deepslate_diamond_ore":  "minecraft:deepslate_iron_ore",
     "minecraft:deepslate_gold_ore":     "minecraft:dirt",
     "minecraft:deepslate_iron_ore":     "minecraft:deepslate_copper_ore",
@@ -70,31 +75,144 @@ const ALL_DOWNGRADES = {
     ...buildArmorDowngrades(),
 };
 
-/**
- * Returns the downgrade target item ID, or undefined if not in any chain.
- */
+/** Returns the downgrade target item ID, or undefined if not in any chain. */
 export function getDowngrade(itemId) {
     return ALL_DOWNGRADES[itemId];
 }
 
-// ── State tracking ─────────────────────────────────────────────────────────────
-// entityId → { lastSlotTypes: Map<slot, string|null>, timers: Map<slot, {typeId, startTick}> }
-//
-// lastSlotTypes tracks what was in each slot on the previous poll so we can
-// detect placement/removal without an item-change event.
-//
-// timers tracks per-slot countdowns. startTick is relative to `currentTick`
-// which starts at 0 each session — ticksRemaining is persisted across restarts.
+// ── State maps ─────────────────────────────────────────────────────────────────
+// Timer state: entityId → { lastSlotTypes: Map<slot, string|null>, timers: Map<slot, {typeId, startTick}> }
 const chestState = new Map();
-let currentTick = 0;
+// Open-chest tracking for animation + close sound
+const openChests = new Map(); // entityId → { entity, lastInteractTick }
+let currentTick  = 0;
 
-const POLL_INTERVAL = 20; // scan inventory every 20 ticks (≈1 second)
-const DIM_IDS = ["overworld", "nether", "the_end"];
+const POLL_INTERVAL = 20; // scan every 20 ticks ≈ 1 second
+const DIM_IDS       = ["overworld", "nether", "the_end"];
+
+// ── Placement helpers ──────────────────────────────────────────────────────────
+const FACE_OFFSETS = {
+    Up:    { x: 0, y: 1,  z: 0  },
+    Down:  { x: 0, y: -1, z: 0  },
+    North: { x: 0, y: 0,  z: -1 },
+    South: { x: 0, y: 0,  z: 1  },
+    East:  { x: 1, y: 0,  z: 0  },
+    West:  { x: -1, y: 0, z: 0  },
+};
+
+/** Entity spawn position: centre of the adjacent block for the given face. */
+function getSpawnLoc(blockLoc, face) {
+    const off = FACE_OFFSETS[face] ?? FACE_OFFSETS.Up;
+    return {
+        x: blockLoc.x + off.x + 0.5,
+        y: blockLoc.y + off.y,
+        z: blockLoc.z + off.z + 0.5,
+    };
+}
+
+/** Remove one prank chest item from the player's hand (survival/adventure only). */
+function consumeItem(player) {
+    if (player.getGameMode() === GameMode.creative) return;
+    try {
+        const inv  = player.getComponent("minecraft:inventory")?.container;
+        const slot = player.selectedSlotIndex;
+        if (!inv) return;
+        const item = inv.getItem(slot);
+        if (!item || item.typeId !== "prankchest:prank_chest") return;
+        if (item.amount > 1) {
+            item.amount--;
+            inv.setItem(slot, item);
+        } else {
+            inv.setItem(slot, undefined); // clear slot
+        }
+    } catch (e) {
+        console.warn("[PrankChest] consumeItem failed:", e);
+    }
+}
+
+// ── Placement: item use on block → spawn entity (REQ-6: zero block flash) ─────
+world.beforeEvents.itemUseOn.subscribe((event) => {
+    if (event.itemStack?.typeId !== "prankchest:prank_chest") return;
+
+    // Cancel default block placement — entity will be spawned instead
+    event.cancel = true;
+
+    const blockLoc  = { ...event.block.location };
+    const face      = event.blockFace;
+    const dim       = event.block.dimension;
+    const spawnLoc  = getSpawnLoc(blockLoc, face);
+    const player    = event.source;
+    const playerYaw = player.getRotation().y;
+
+    system.run(() => {
+        // Validate: target space must be air
+        const adjBlock = dim.getBlock({
+            x: Math.floor(spawnLoc.x),
+            y: Math.floor(spawnLoc.y),
+            z: Math.floor(spawnLoc.z),
+        });
+        if (!adjBlock || adjBlock.typeId !== "minecraft:air") return;
+
+        // Spawn entity and orient it to face toward the player (REQ-2)
+        // Chest yaw = playerYaw + 180 so the opening faces back at the player
+        const entity    = dim.spawnEntity("prankchest:prank_chest", spawnLoc);
+        const chestYaw  = ((playerYaw + 180) % 360 + 360) % 360;
+        entity.setRotation({ x: 0, y: chestYaw });
+
+        consumeItem(player);
+    });
+});
+
+// ── Interaction: open sound + animation trigger (REQ-3) ────────────────────────
+world.afterEvents.playerInteractWithEntity.subscribe((event) => {
+    const entity = event.target;
+    if (entity.typeId !== "prankchest:prank_chest") return;
+
+    try {
+        entity.setProperty("prankchest:is_open", true);
+        entity.dimension.playSound("mob.chest.open", entity.location, {
+            volume: 0.7,
+            pitch: 0.9,
+        });
+        openChests.set(entity.id, { entity, lastInteractTick: currentTick });
+    } catch (e) {
+        console.warn("[PrankChest] Open chest error:", e);
+    }
+});
 
 // ── Main polling loop ──────────────────────────────────────────────────────────
 system.runInterval(() => {
     currentTick += POLL_INTERVAL;
 
+    // ── Auto-close chests when players move away (REQ-3) ──
+    for (const [entityId, info] of openChests) {
+        let shouldClose = true;
+        try {
+            const nearby = info.entity.dimension.getPlayers({
+                location: info.entity.location,
+                maxDistance: 5,
+            });
+            shouldClose = nearby.length === 0;
+        } catch {
+            // Entity no longer valid
+            chestState.delete(entityId);
+            openChests.delete(entityId);
+            continue;
+        }
+
+        if (shouldClose) {
+            try {
+                info.entity.setProperty("prankchest:is_open", false);
+                info.entity.dimension.playSound("mob.chest.close", info.entity.location, {
+                    volume: 0.7,
+                    pitch: 0.9,
+                });
+            } catch { /* entity gone mid-loop */ }
+            openChests.delete(entityId);
+        }
+    }
+
+    // ── Downgrade timer logic ──
     for (const dimId of DIM_IDS) {
         let dim;
         try { dim = world.getDimension(dimId); } catch { continue; }
@@ -112,14 +230,13 @@ system.runInterval(() => {
 function processPrankChest(entity) {
     const id = entity.id;
 
-    // First time we see this entity: init state and reload persisted timers
     if (!chestState.has(id)) {
         const state = { lastSlotTypes: new Map(), timers: new Map() };
         chestState.set(id, state);
         restoreTimers(entity, state);
     }
 
-    const state = chestState.get(id);
+    const state   = chestState.get(id);
     const invComp = entity.getComponent("minecraft:inventory");
     if (!invComp?.container) return;
 
@@ -132,17 +249,14 @@ function processPrankChest(entity) {
         const prevTypeId    = state.lastSlotTypes.get(slot) ?? null;
 
         if (currentTypeId !== prevTypeId) {
-            // Slot contents changed — update tracking and reset/start timer
+            // Slot contents changed — reset timer
             state.lastSlotTypes.set(slot, currentTypeId);
 
             if (currentTypeId === null) {
-                // Item removed — cancel timer
                 state.timers.delete(slot);
             } else if (ALL_DOWNGRADES[currentTypeId]) {
-                // Downgradeable item placed — start countdown
                 state.timers.set(slot, { typeId: currentTypeId, startTick: currentTick });
             } else {
-                // Non-downgradeable item — no timer needed
                 state.timers.delete(slot);
             }
 
@@ -150,7 +264,6 @@ function processPrankChest(entity) {
             continue;
         }
 
-        // Same type as last poll — check if timer has expired
         const timer = state.timers.get(slot);
         if (!timer) continue;
 
@@ -166,11 +279,10 @@ function processPrankChest(entity) {
             dirty = true;
 
             if (CONFIG.playSoundOnDowngrade) {
-                entity.dimension.playSound(
-                    "random.click",
-                    entity.location,
-                    { volume: 0.5, pitch: 1.5 }
-                );
+                entity.dimension.playSound("random.click", entity.location, {
+                    volume: 0.5,
+                    pitch: 1.5,
+                });
             }
 
             if (CONFIG.showParticlesOnDowngrade) {
@@ -186,9 +298,6 @@ function processPrankChest(entity) {
 }
 
 // ── Timer persistence ──────────────────────────────────────────────────────────
-// Timers survive chunk unloads and server restarts via entity dynamic properties.
-// We store ticksRemaining (not absolute startTick) so restarts don't corrupt timers.
-
 function saveTimers(entity, state) {
     const data = {};
     for (const [slot, timer] of state.timers) {
@@ -211,7 +320,6 @@ function restoreTimers(entity, state) {
         const data = JSON.parse(raw);
         for (const [slotStr, entry] of Object.entries(data)) {
             const slot      = parseInt(slotStr, 10);
-            // Reconstruct a startTick such that elapsed = delay - remaining
             const startTick = currentTick - (CONFIG.downgradeDelayTicks - entry.ticksRemaining);
             state.timers.set(slot, { typeId: entry.typeId, startTick });
         }
@@ -220,31 +328,7 @@ function restoreTimers(entity, state) {
     }
 }
 
-// ── Block → entity conversion ──────────────────────────────────────────────────
-// The craftable item is a block (prankchest:prank_chest).  The moment it's placed
-// we swap it for the actual chest entity so inventory and timer logic can run.
-world.afterEvents.playerPlaceBlock.subscribe((event) => {
-    if (event.block.typeId !== "prankchest:prank_chest") return;
-
-    const blockLoc = { ...event.block.location };
-    const dim      = event.block.dimension;
-
-    // Defer one tick so the block placement event fully resolves first
-    system.run(() => {
-        const block = dim.getBlock(blockLoc);
-        block?.setPermutation(BlockPermutation.resolve("minecraft:air"));
-
-        dim.spawnEntity("prankchest:prank_chest", {
-            x: blockLoc.x + 0.5,
-            y: blockLoc.y,
-            z: blockLoc.z + 0.5,
-        });
-    });
-});
-
-// ── Entity destroyed → drop inventory ─────────────────────────────────────────
-// When the chest entity is killed (players break it), explicitly scatter its
-// contents as item drops.  The loot table drops the prank_chest item itself.
+// ── Entity death → drop inventory (covers breaks AND explosions — REQ-4) ───────
 world.afterEvents.entityDie.subscribe((event) => {
     const entity = event.deadEntity;
     if (entity.typeId !== "prankchest:prank_chest") return;
@@ -252,6 +336,8 @@ world.afterEvents.entityDie.subscribe((event) => {
     const dim = entity.dimension;
     const loc = { ...entity.location };
 
+    // Scatter all stored items — items haven't been downgraded yet if timer
+    // hadn't expired, so they drop in original form automatically.
     const invComp = entity.getComponent("minecraft:inventory");
     if (invComp?.container) {
         const container = invComp.container;
@@ -261,9 +347,13 @@ world.afterEvents.entityDie.subscribe((event) => {
         }
     }
 
+    // Loot table (defined in loot_tables/entities/prank_chest.json)
+    // handles dropping the prank_chest block item itself.
+
     chestState.delete(entity.id);
+    openChests.delete(entity.id);
 });
 
 world.afterEvents.worldInitialize.subscribe(() => {
-    console.log("[PrankChest] Loaded v0.1.0");
+    console.log("[PrankChest] Loaded v0.1.1");
 });
