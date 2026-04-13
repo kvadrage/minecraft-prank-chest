@@ -6,13 +6,14 @@
         },
         "tags": ["crafting_table"],
         "pattern": [
-            "###",
+            "#P#",
             "#R#",
             "###"
         ],
         "key": {
             "#": { "tag": "minecraft:planks" },
-            "R": { "item": "minecraft:redstone" }
+            "R": { "item": "minecraft:redstone" },
+            "P": { "item": "minecraft:paper" }
         },
         "result": {
             "item": "prankchest:prank_chest",

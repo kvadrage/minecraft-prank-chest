@@ -3,6 +3,9 @@
     "minecraft:client_entity": {
         "description": {
             "identifier": "prankchest:prank_chest",
+            "materials": {
+                "default": "entity_alphatest"
+            },
             "textures": {
                 "default": "textures/entity/chest/normal"
             },
