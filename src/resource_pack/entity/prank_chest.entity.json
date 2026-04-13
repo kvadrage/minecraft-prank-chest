@@ -10,7 +10,7 @@
                 "default": "textures/entity/chest/normal"
             },
             "geometry": {
-                "default": "geometry.chest"
+                "default": "geometry.prank_chest"
             },
             "animations": {
                 "open_lid":       "animation.prank_chest.open_lid",
