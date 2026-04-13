@@ -1,5 +1,6 @@
-// Prank Chest — Main Script  v0.1.1
-// Entity-based approach: prank_chest entity owns inventory; script manages timers.
+// Prank Chest — Main Script  v0.2.0
+// Architecture: vanilla minecraft:chest + Script API prank registry.
+// No custom entity, no custom block in the world — the placed object IS a real chest.
 
 import {
     world,
@@ -11,12 +12,12 @@ import {
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 const CONFIG = {
-    downgradeDelayTicks: 1000,      // Default: 1 in-game hour (50 real seconds)
-    playSoundOnDowngrade: true,
+    downgradeDelayTicks:    1000,   // 1 in-game hour ≈ 50 real seconds at default speed
+    playSoundOnDowngrade:   true,
     showParticlesOnDowngrade: false,
 };
 
-// ── Downgrade tables ───────────────────────────────────────────────────────────
+// ── Downgrade tables (reused from v0.1.1 — logic unchanged) ───────────────────
 const ORE_DOWNGRADES = {
     "minecraft:ancient_debris":         "minecraft:diamond_ore",
     "minecraft:diamond_ore":            "minecraft:iron_ore",
@@ -75,22 +76,131 @@ const ALL_DOWNGRADES = {
     ...buildArmorDowngrades(),
 };
 
-/** Returns the downgrade target item ID, or undefined if not in any chain. */
-export function getDowngrade(itemId) {
-    return ALL_DOWNGRADES[itemId];
+// ── Registry ───────────────────────────────────────────────────────────────────
+// Registry format stored in world dynamic property "prankchest:registry":
+//   { [key]: { [slot]: { typeId: string, rem: number } } }
+//
+//   key  = "${x},${y},${z},${dim.id}"  (integer coords + actual Dimension.id)
+//   rem  = ticks remaining at time of last save (abbreviated to keep JSON small)
+//
+// Only slots with active timers are stored per chest entry. A chest with no active
+// timers is stored as an empty object {}  — this marks it as a prank chest even
+// when no timer is running.
+//
+// Size estimate: ~200 chars per active chest (pessimistic). The world dynamic
+// property string limit is 32767 chars in @minecraft/server 1.16.0 stable.
+// That's ~160 simultaneous prank chests. Exceeding this logs a warning.
+// TODO: verify in-game — confirm actual dynamic property size limit on 1.26.1301.0
+
+const REGISTRY_PROP          = "prankchest:registry";
+const REGISTRY_PROP_MAX_CHARS = 32000; // leave 767 chars headroom under the 32767 limit
+
+// Canonical registry (mirrors what's on disk). Loaded once at worldInitialize.
+// Plain object so JSON.stringify/parse roundtrips cleanly.
+let registry       = {};
+let registryLoaded = false;
+
+// In-memory timer state — rebuilt from registry on first access per chest.
+// Map<key, { lastSlotTypes: Map<slot, string|null>, timers: Map<slot, {typeId, startTick}> }>
+const chestState = new Map();
+
+// Tracks keys with a pending break in the current/next tick so we don't double-process
+// if the player somehow triggers two break events before system.run fires.
+const pendingBreak = new Set();
+
+let currentTick  = 0;
+const POLL_INTERVAL    = 20;   // ticks between downgrade scans ≈ 1 second
+const CLEANUP_INTERVAL = 6000; // ticks between stale-registry sweeps ≈ 5 minutes
+
+// getDimension accepts these short names in stable API; dim.id may return the
+// "minecraft:" prefixed form — we always use dim.id when building/matching keys.
+const DIM_NAMES = ["overworld", "nether", "the_end"];
+
+// ── Key helpers ────────────────────────────────────────────────────────────────
+function blockKey(block) {
+    const l = block.location;
+    // Use block.dimension.id (runtime value) rather than the short lookup name
+    // so keys are consistent regardless of what Dimension.id returns.
+    // TODO: verify in-game — confirm Dimension.id format on 1.26.1301.0
+    // (expected: "minecraft:overworld" / "overworld" — either is fine as long as consistent)
+    return `${Math.floor(l.x)},${Math.floor(l.y)},${Math.floor(l.z)},${block.dimension.id}`;
 }
 
-// ── State maps ─────────────────────────────────────────────────────────────────
-// Timer state: entityId → { lastSlotTypes: Map<slot, string|null>, timers: Map<slot, {typeId, startTick}> }
-const chestState = new Map();
-// Open-chest tracking for animation + close sound
-const openChests = new Map(); // entityId → { entity, lastInteractTick }
-let currentTick  = 0;
+function coordKey(x, y, z, dimId) {
+    return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)},${dimId}`;
+}
 
-const POLL_INTERVAL = 20; // scan every 20 ticks ≈ 1 second
-const DIM_IDS       = ["overworld", "nether", "the_end"];
+function parseKey(key) {
+    // key = "x,y,z,dimId" where dimId may itself contain colons (e.g. "minecraft:overworld")
+    // Split on comma — coords are integers so no ambiguity with negative signs.
+    const firstComma  = key.indexOf(",");
+    const secondComma = key.indexOf(",", firstComma + 1);
+    const thirdComma  = key.indexOf(",", secondComma + 1);
+    return {
+        x:     parseInt(key.slice(0, firstComma)),
+        y:     parseInt(key.slice(firstComma + 1, secondComma)),
+        z:     parseInt(key.slice(secondComma + 1, thirdComma)),
+        dimId: key.slice(thirdComma + 1),
+    };
+}
 
-// ── Placement helpers ──────────────────────────────────────────────────────────
+// ── Registry persistence ───────────────────────────────────────────────────────
+function loadRegistry() {
+    try {
+        const raw = world.getDynamicProperty(REGISTRY_PROP);
+        if (typeof raw === "string" && raw.length > 0) {
+            registry = JSON.parse(raw);
+            console.log(`[PrankChest] Registry loaded — ${Object.keys(registry).length} chest(s)`);
+        } else {
+            registry = {};
+            console.log("[PrankChest] Registry empty (fresh world or first install)");
+        }
+    } catch (e) {
+        console.warn("[PrankChest] Failed to load registry, starting empty:", e);
+        registry = {};
+    }
+}
+
+function saveRegistry() {
+    try {
+        const str = JSON.stringify(registry);
+        if (str.length > REGISTRY_PROP_MAX_CHARS) {
+            console.warn(
+                `[PrankChest] Registry is ${str.length} chars — approaching the 32767-char ` +
+                `limit. Remove old prank chests to free space.`
+            );
+        }
+        world.setDynamicProperty(REGISTRY_PROP, str);
+    } catch (e) {
+        console.warn("[PrankChest] Failed to save registry:", e);
+    }
+}
+
+function registerChest(key) {
+    if (!(key in registry)) {
+        registry[key] = {};
+        saveRegistry();
+    }
+}
+
+function unregisterChest(key) {
+    if (key in registry) {
+        delete registry[key];
+        chestState.delete(key);
+        saveRegistry();
+        console.log(`[PrankChest] Unregistered ${key}`);
+    }
+}
+
+function isPrankChest(key) {
+    return key in registry;
+}
+
+// ── Placement ──────────────────────────────────────────────────────────────────
+// MUST: The placed object is a real minecraft:chest — not a custom block or entity.
+// We intercept beforeEvents.itemUseOn, cancel the default item-use, then in the
+// next tick place a vanilla chest via block.setPermutation().
+
 const FACE_OFFSETS = {
     Up:    { x: 0, y: 1,  z: 0  },
     Down:  { x: 0, y: -1, z: 0  },
@@ -100,17 +210,22 @@ const FACE_OFFSETS = {
     West:  { x: -1, y: 0, z: 0  },
 };
 
-/** Entity spawn position: centre of the adjacent block for the given face. */
-function getSpawnLoc(blockLoc, face) {
-    const off = FACE_OFFSETS[face] ?? FACE_OFFSETS.Up;
-    return {
-        x: blockLoc.x + off.x + 0.5,
-        y: blockLoc.y + off.y,
-        z: blockLoc.z + off.z + 0.5,
-    };
+/**
+ * Convert player yaw to minecraft:cardinal_direction for a vanilla chest.
+ * Bedrock yaw convention: 0 = south, 90 = west, 180 = north, 270 = east.
+ * We set cardinal_direction = the direction the player is facing so the chest
+ * front faces toward the player (matching vanilla placement behavior).
+ * // TODO: verify in-game — if the chest faces backward, flip to the opposite direction
+ */
+function yawToCardinal(yaw) {
+    const n = ((yaw % 360) + 360) % 360;
+    if (n >= 315 || n < 45)  return "south";
+    if (n >= 45  && n < 135) return "west";
+    if (n >= 135 && n < 225) return "north";
+    return "east"; // 225–315
 }
 
-/** Remove one prank chest item from the player's hand (survival/adventure only). */
+/** Remove one prankchest:prank_chest item from the player's selected slot. */
 function consumeItem(player) {
     if (player.getGameMode() === GameMode.creative) return;
     try {
@@ -130,117 +245,237 @@ function consumeItem(player) {
     }
 }
 
-// ── Placement: item use on block → spawn entity (REQ-6: zero block flash) ─────
 world.beforeEvents.itemUseOn.subscribe((event) => {
     if (event.itemStack?.typeId !== "prankchest:prank_chest") return;
 
-    // Cancel default block placement — entity will be spawned instead
+    // Cancel default item behavior (prevents any block placer component from firing).
     event.cancel = true;
 
-    const blockLoc  = { ...event.block.location };
+    // Capture everything we need now — block/player refs can become stale after system.run.
+    const targetLoc = { ...event.block.location };
     const face      = event.blockFace;
     const dim       = event.block.dimension;
-    const spawnLoc  = getSpawnLoc(blockLoc, face);
     const player    = event.source;
-    const playerYaw = player.getRotation().y;
+    const yaw       = player.getRotation().y;
 
     system.run(() => {
-        // Validate: target space must be air
-        const adjBlock = dim.getBlock({
-            x: Math.floor(spawnLoc.x),
-            y: Math.floor(spawnLoc.y),
-            z: Math.floor(spawnLoc.z),
-        });
-        if (!adjBlock || adjBlock.typeId !== "minecraft:air") return;
+        if (!registryLoaded) return;
 
-        // Spawn entity and orient it to face toward the player (REQ-2)
-        // Chest yaw = playerYaw + 180 so the opening faces back at the player
-        const entity    = dim.spawnEntity("prankchest:prank_chest", spawnLoc);
-        const chestYaw  = ((playerYaw + 180) % 360 + 360) % 360;
-        entity.setRotation({ x: 0, y: chestYaw });
+        const off      = FACE_OFFSETS[face] ?? FACE_OFFSETS.Up;
+        const chestLoc = {
+            x: targetLoc.x + off.x,
+            y: targetLoc.y + off.y,
+            z: targetLoc.z + off.z,
+        };
 
+        const block = dim.getBlock(chestLoc);
+        if (!block) return; // chunk unloaded — bail
+
+        // Only place into air (never overwrite another block)
+        if (block.typeId !== "minecraft:air") return;
+
+        const facing = yawToCardinal(yaw);
+
+        try {
+            // Place a real vanilla chest with the correct facing permutation.
+            // BlockPermutation.resolve is stable API and the correct way to set
+            // block state without going through a slash command.
+            block.setPermutation(
+                BlockPermutation.resolve("minecraft:chest", {
+                    "minecraft:cardinal_direction": facing,
+                })
+            );
+        } catch (e) {
+            console.warn("[PrankChest] Failed to place vanilla chest:", e);
+            return;
+        }
+
+        const key = coordKey(chestLoc.x, chestLoc.y, chestLoc.z, dim.id);
+        registerChest(key);
         consumeItem(player);
+        console.log(`[PrankChest] Placed prank chest at ${key} facing ${facing}`);
     });
 });
 
-// ── Interaction: open sound + animation trigger (REQ-3) ────────────────────────
-world.afterEvents.playerInteractWithEntity.subscribe((event) => {
-    const entity = event.target;
-    if (entity.typeId !== "prankchest:prank_chest") return;
+// ── Break interception ─────────────────────────────────────────────────────────
+// CHOICE: Option A — beforeEvents.playerBreakBlock (cancel + manual drop).
+//
+// Why not Option B: vanilla break + extra drop means the player receives both a
+// normal chest item AND a prankchest item — exploitable, confusing, messy.
+//
+// Why not Option C: finding the dropped chest entity by proximity is fragile:
+// timing varies by TPS, multiple nearby chests confuse entity matching, and item
+// entities can be picked up by hoppers/players in the same tick.
+//
+// Option A is clean: cancel prevents all vanilla break behavior (no chest item
+// drop, no inventory scatter). We then manually drop contents + prank item and
+// remove the block. One downside: the player's tool does NOT take durability
+// damage for this break (the cancel fires before vanilla durability processing).
+// This is a minor cosmetic inconsistency, acceptable for v0.2.
 
+world.beforeEvents.playerBreakBlock.subscribe((event) => {
+    const key = blockKey(event.block);
+    if (!isPrankChest(key)) return;
+    if (pendingBreak.has(key)) return; // already queued this tick — don't double-process
+
+    event.cancel = true;
+    pendingBreak.add(key);
+
+    // Capture block location + dimension before the async gap.
+    // The block still exists next tick because we cancelled the break.
+    const blockLoc = { ...event.block.location };
+    const dim      = event.block.dimension;
+
+    system.run(() => {
+        pendingBreak.delete(key);
+
+        const b = dim.getBlock(blockLoc);
+        if (!b || b.typeId !== "minecraft:chest") {
+            // Block already gone (lost to a race with explosion or /fill).
+            // Still clean up the registry.
+            unregisterChest(key);
+            return;
+        }
+
+        // Drop all stored items in their CURRENT (possibly partially downgraded) form.
+        // MUST: contents drop in original (non-downgraded) form per spec, meaning items
+        // that haven't hit their timer yet. The timer data reflects this — items that
+        // have already been downgraded are stored under their downgraded typeId, which
+        // is the current state of the slot (correct). Items mid-timer haven't changed
+        // yet, so they drop as-is (also correct).
+        const inv = b.getComponent("minecraft:inventory");
+        // TODO: verify in-game — block inventory component name:
+        //   "minecraft:inventory" matches the entity convention; if undefined, try "inventory"
+        const container = inv?.container;
+        if (container) {
+            for (let slot = 0; slot < container.size; slot++) {
+                const item = container.getItem(slot);
+                if (item) dim.spawnItem(item, blockLoc);
+            }
+        }
+
+        // Drop the prank_chest item (MUST: NOT a normal minecraft:chest item).
+        dim.spawnItem(new ItemStack("prankchest:prank_chest", 1), blockLoc);
+
+        // Remove the vanilla chest block (no vanilla drops — we handled everything above).
+        // setPermutation to air is the stable, scriptable way to clear a block.
+        // TODO: verify in-game — if setPermutation("minecraft:air") throws, use
+        //   player.runCommand("setblock x y z air") as fallback
+        try {
+            b.setPermutation(BlockPermutation.resolve("minecraft:air"));
+        } catch (e) {
+            console.warn("[PrankChest] setPermutation(air) failed on break:", e);
+        }
+
+        unregisterChest(key);
+    });
+});
+
+// ── Explosion handling ─────────────────────────────────────────────────────────
+// CHOICE: beforeEvents.explosion to identify prank chests about to be destroyed,
+// then system.run() to do registry cleanup after the explosion completes.
+//
+// Why before and not after: in the before event the blocks still exist, so we can
+// confirm they are minecraft:chest and in our registry. After the explosion the
+// blocks are already replaced with air/debris and harder to identify.
+//
+// We do NOT attempt to intercept the explosion or spawn a prankchest item drop —
+// the spec only requires registry cleanup for TNT (testing checklist item 10),
+// not a special item drop. Vanilla loot (normal chest item) will scatter with the
+// explosion, which is acceptable for this case.
+//
+// Periodic cleanup (below) is belt-and-suspenders for pistons, /fill, and other
+// block-removal paths that don't fire a playerBreakBlock event.
+// TODO: verify in-game — confirm beforeEvents.explosion.getImpactedBlocks() is
+//   available in @minecraft/server 1.16.0 stable on Bedrock 1.26.1301.0
+
+world.beforeEvents.explosion.subscribe((event) => {
     try {
-        entity.setProperty("prankchest:is_open", true);
-        entity.dimension.playSound("mob.chest.open", entity.location, {
-            volume: 0.7,
-            pitch: 0.9,
-        });
-        openChests.set(entity.id, { entity, lastInteractTick: currentTick });
+        const impacted = event.getImpactedBlocks();
+        const toRemove = [];
+        for (const block of impacted) {
+            const key = blockKey(block);
+            if (isPrankChest(key)) toRemove.push(key);
+        }
+        if (toRemove.length > 0) {
+            // Defer registry mutation to outside the before-event (can't write
+            // dynamic properties synchronously in a beforeEvent handler).
+            system.run(() => {
+                for (const key of toRemove) unregisterChest(key);
+            });
+        }
     } catch (e) {
-        console.warn("[PrankChest] Open chest error:", e);
+        console.warn("[PrankChest] explosion handler error:", e);
     }
 });
 
-// ── Main polling loop ──────────────────────────────────────────────────────────
-system.runInterval(() => {
-    currentTick += POLL_INTERVAL;
+// ── Timer state helpers ────────────────────────────────────────────────────────
 
-    // ── Auto-close chests when players move away (REQ-3) ──
-    for (const [entityId, info] of openChests) {
-        let shouldClose = true;
-        try {
-            const nearby = info.entity.dimension.getPlayers({
-                location: info.entity.location,
-                maxDistance: 5,
-            });
-            shouldClose = nearby.length === 0;
-        } catch {
-            // Entity no longer valid
-            chestState.delete(entityId);
-            openChests.delete(entityId);
-            continue;
-        }
-
-        if (shouldClose) {
-            try {
-                info.entity.setProperty("prankchest:is_open", false);
-                info.entity.dimension.playSound("mob.chest.close", info.entity.location, {
-                    volume: 0.7,
-                    pitch: 0.9,
-                });
-            } catch { /* entity gone mid-loop */ }
-            openChests.delete(entityId);
+/** Build in-memory state for a key, restoring persisted timers from registry. */
+function initChestState(key) {
+    const state = { lastSlotTypes: new Map(), timers: new Map() };
+    const saved = registry[key];
+    if (saved) {
+        for (const [slotStr, entry] of Object.entries(saved)) {
+            const slot      = parseInt(slotStr, 10);
+            // Reconstruct startTick so that elapsed = currentTick - startTick
+            // gives the correct remaining time after reload.
+            const startTick = currentTick - (CONFIG.downgradeDelayTicks - entry.rem);
+            state.timers.set(slot, { typeId: entry.typeId, startTick });
         }
     }
+    chestState.set(key, state);
+    return state;
+}
 
-    // ── Downgrade timer logic ──
-    for (const dimId of DIM_IDS) {
-        let dim;
-        try { dim = world.getDimension(dimId); } catch { continue; }
-
-        for (const entity of dim.getEntities({ type: "prankchest:prank_chest" })) {
-            try {
-                processPrankChest(entity);
-            } catch (e) {
-                console.warn(`[PrankChest] Error processing ${entity.id}: ${e}`);
-            }
-        }
+/**
+ * Flush in-memory timer state back into the registry object for this key.
+ * Does NOT call saveRegistry() — caller batches disk writes to avoid per-slot saves.
+ */
+function flushTimers(key, state) {
+    const out = {};
+    for (const [slot, timer] of state.timers) {
+        const elapsed   = currentTick - timer.startTick;
+        const remaining = Math.max(0, CONFIG.downgradeDelayTicks - elapsed);
+        out[slot] = { typeId: timer.typeId, rem: remaining };
     }
-}, POLL_INTERVAL);
+    registry[key] = out;
+}
 
-function processPrankChest(entity) {
-    const id = entity.id;
+// ── Per-chest downgrade processing ────────────────────────────────────────────
 
-    if (!chestState.has(id)) {
-        const state = { lastSlotTypes: new Map(), timers: new Map() };
-        chestState.set(id, state);
-        restoreTimers(entity, state);
+/**
+ * Process one prank chest for timer advancement and downgrade application.
+ * Returns true if the registry changed (caller should call saveRegistry).
+ * Returns false if the chunk is unloaded or nothing changed.
+ */
+function processPrankChest(key, dim) {
+    const { x, y, z } = parseKey(key);
+    const block = dim.getBlock({ x, y, z });
+
+    if (!block) {
+        // Chunk is unloaded — skip this cycle, timers pause (intentional: same
+        // behavior as vanilla mob timers, items, etc. in unloaded chunks).
+        return false;
     }
 
-    const state   = chestState.get(id);
-    const invComp = entity.getComponent("minecraft:inventory");
-    if (!invComp?.container) return;
+    if (block.typeId !== "minecraft:chest") {
+        // Block is no longer a chest — must have been removed by piston, /fill,
+        // or some other non-player path that bypassed our break handler.
+        unregisterChest(key); // this calls saveRegistry internally
+        return false;
+    }
 
-    const container = invComp.container;
+    if (!chestState.has(key)) {
+        initChestState(key);
+    }
+
+    const state   = chestState.get(key);
+    const inv     = block.getComponent("minecraft:inventory");
+    // TODO: verify in-game — same inventory component name concern as in break handler
+    const container = inv?.container;
+    if (!container) return false;
+
     let dirty = false;
 
     for (let slot = 0; slot < container.size; slot++) {
@@ -249,19 +484,18 @@ function processPrankChest(entity) {
         const prevTypeId    = state.lastSlotTypes.get(slot) ?? null;
 
         if (currentTypeId !== prevTypeId) {
-            // Slot contents changed — reset timer
+            // Contents changed — reset the timer for this slot.
             state.lastSlotTypes.set(slot, currentTypeId);
 
-            if (currentTypeId === null) {
+            if (currentTypeId === null || !ALL_DOWNGRADES[currentTypeId]) {
+                // Slot empty or item not in any downgrade chain — no timer needed.
                 state.timers.delete(slot);
-            } else if (ALL_DOWNGRADES[currentTypeId]) {
-                state.timers.set(slot, { typeId: currentTypeId, startTick: currentTick });
             } else {
-                state.timers.delete(slot);
+                state.timers.set(slot, { typeId: currentTypeId, startTick: currentTick });
             }
 
             dirty = true;
-            continue;
+            continue; // don't evaluate the timer we just (re)set this tick
         }
 
         const timer = state.timers.get(slot);
@@ -270,7 +504,7 @@ function processPrankChest(entity) {
         const elapsed = currentTick - timer.startTick;
         if (elapsed < CONFIG.downgradeDelayTicks) continue;
 
-        // ── Timer expired: perform downgrade ──
+        // ── Timer expired: apply downgrade ──
         const targetId = ALL_DOWNGRADES[timer.typeId];
         if (targetId && item) {
             container.setItem(slot, new ItemStack(targetId, item.amount));
@@ -279,81 +513,91 @@ function processPrankChest(entity) {
             dirty = true;
 
             if (CONFIG.playSoundOnDowngrade) {
-                entity.dimension.playSound("random.click", entity.location, {
-                    volume: 0.5,
-                    pitch: 1.5,
-                });
+                dim.playSound("random.click", block.location, { volume: 0.5, pitch: 1.5 });
             }
-
             if (CONFIG.showParticlesOnDowngrade) {
-                entity.dimension.spawnParticle(
+                dim.spawnParticle(
                     "minecraft:redstone_ore_dust_particle",
-                    { x: entity.location.x, y: entity.location.y + 0.5, z: entity.location.z }
+                    { x: block.location.x, y: block.location.y + 0.5, z: block.location.z }
                 );
             }
         }
     }
 
-    if (dirty) saveTimers(entity, state);
+    if (dirty) {
+        flushTimers(key, state);
+        return true;
+    }
+    return false;
 }
 
-// ── Timer persistence ──────────────────────────────────────────────────────────
-function saveTimers(entity, state) {
-    const data = {};
-    for (const [slot, timer] of state.timers) {
-        const elapsed   = currentTick - timer.startTick;
-        const remaining = Math.max(0, CONFIG.downgradeDelayTicks - elapsed);
-        data[slot] = { typeId: timer.typeId, ticksRemaining: remaining };
-    }
-    try {
-        entity.setDynamicProperty("prank_chest_timers", JSON.stringify(data));
-    } catch (e) {
-        console.warn("[PrankChest] Failed to save timers:", e);
-    }
-}
+// ── Main polling loop ──────────────────────────────────────────────────────────
+system.runInterval(() => {
+    if (!registryLoaded) return;
 
-function restoreTimers(entity, state) {
-    try {
-        const raw = entity.getDynamicProperty("prank_chest_timers");
-        if (typeof raw !== "string") return;
+    currentTick += POLL_INTERVAL;
+    let needsSave = false;
 
-        const data = JSON.parse(raw);
-        for (const [slotStr, entry] of Object.entries(data)) {
-            const slot      = parseInt(slotStr, 10);
-            const startTick = currentTick - (CONFIG.downgradeDelayTicks - entry.ticksRemaining);
-            state.timers.set(slot, { typeId: entry.typeId, startTick });
-        }
-    } catch (e) {
-        console.warn("[PrankChest] Failed to restore timers:", e);
-    }
-}
+    for (const dimName of DIM_NAMES) {
+        let dim;
+        try { dim = world.getDimension(dimName); } catch { continue; }
 
-// ── Entity death → drop inventory (covers breaks AND explosions — REQ-4) ───────
-world.afterEvents.entityDie.subscribe((event) => {
-    const entity = event.deadEntity;
-    if (entity.typeId !== "prankchest:prank_chest") return;
+        // Use dim.id (the runtime dimension identifier) for key matching, not dimName.
+        // These may differ (e.g. "overworld" vs "minecraft:overworld").
+        const dimId = dim.id;
 
-    const dim = entity.dimension;
-    const loc = { ...entity.location };
-
-    // Scatter all stored items — items haven't been downgraded yet if timer
-    // hadn't expired, so they drop in original form automatically.
-    const invComp = entity.getComponent("minecraft:inventory");
-    if (invComp?.container) {
-        const container = invComp.container;
-        for (let slot = 0; slot < container.size; slot++) {
-            const item = container.getItem(slot);
-            if (item) dim.spawnItem(item, loc);
+        for (const key of Object.keys(registry)) {
+            if (!key.endsWith(`,${dimId}`)) continue;
+            try {
+                if (processPrankChest(key, dim)) needsSave = true;
+            } catch (e) {
+                console.warn(`[PrankChest] Error processing ${key}:`, e);
+            }
         }
     }
 
-    // Loot table (defined in loot_tables/entities/prank_chest.json)
-    // handles dropping the prank_chest block item itself.
+    if (needsSave) saveRegistry();
+}, POLL_INTERVAL);
 
-    chestState.delete(entity.id);
-    openChests.delete(entity.id);
-});
+// ── Periodic stale-registry cleanup ───────────────────────────────────────────
+// Belt-and-suspenders for block-removal paths that bypass playerBreakBlock:
+// pistons, /fill, /setblock, or any other world modification. Runs every ~5 minutes.
+// Only checks blocks in loaded chunks (undefined from getBlock = skip, not remove).
+system.runInterval(() => {
+    if (!registryLoaded) return;
 
+    let removed = 0;
+
+    for (const dimName of DIM_NAMES) {
+        let dim;
+        try { dim = world.getDimension(dimName); } catch { continue; }
+        const dimId = dim.id;
+
+        for (const key of Object.keys(registry)) {
+            if (!key.endsWith(`,${dimId}`)) continue;
+            try {
+                const { x, y, z } = parseKey(key);
+                const block = dim.getBlock({ x, y, z });
+                if (block && block.typeId !== "minecraft:chest") {
+                    // Block is loaded and is NOT a chest → stale entry.
+                    unregisterChest(key);
+                    removed++;
+                }
+                // If block is undefined (chunk unloaded), leave entry intact.
+            } catch {
+                // Skip any inaccessible position this cycle.
+            }
+        }
+    }
+
+    if (removed > 0) {
+        console.log(`[PrankChest] Periodic cleanup removed ${removed} stale registry entry(s)`);
+    }
+}, CLEANUP_INTERVAL);
+
+// ── World init ─────────────────────────────────────────────────────────────────
 world.afterEvents.worldInitialize.subscribe(() => {
-    console.log("[PrankChest] Loaded v0.1.1");
+    loadRegistry();
+    registryLoaded = true;
+    console.log("[PrankChest] Loaded v0.2.0");
 });

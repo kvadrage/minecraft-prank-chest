@@ -4,20 +4,20 @@
         "name": "Prank Chest",
         "description": "A deceptive chest that secretly downgrades your items!",
         "uuid": "e39612b7-1e67-4fc8-a292-de4d26796ffc",
-        "version": [0, 1, 0],
+        "version": [0, 2, 0],
         "min_engine_version": [1, 21, 0]
     },
     "modules": [
         {
             "type": "data",
             "uuid": "4d7cc7fb-677b-4557-ada0-71fbbfb6fe38",
-            "version": [0, 1, 0]
+            "version": [0, 2, 0]
         },
         {
             "type": "script",
             "language": "javascript",
             "uuid": "8d97c2e5-1e31-425d-85ca-3889cc0437a7",
-            "version": [0, 1, 0],
+            "version": [0, 2, 0],
             "entry": "scripts/main.js"
         }
     ],
@@ -28,7 +28,7 @@
         },
         {
             "uuid": "084bec7c-e550-4a0c-ae13-a9afdd97ff7e",
-            "version": [0, 1, 0]
+            "version": [0, 2, 0]
         }
     ]
 }

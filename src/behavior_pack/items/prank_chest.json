@@ -1,0 +1,18 @@
+{
+    "format_version": "1.20.50",
+    "minecraft:item": {
+        "description": {
+            "identifier": "prankchest:prank_chest",
+            "menu_category": {
+                "category": "construction",
+                "group": "itemGroup.name.chest"
+            }
+        },
+        "components": {
+            "minecraft:max_stack_size": 64,
+            "minecraft:icon": {
+                "texture": "prank_chest"
+            }
+        }
+    }
+}
