@@ -7,6 +7,13 @@ A Minecraft Bedrock Edition 1.21.50+ addon. A chest that looks identical to a va
 **v0.2.0** on branch `feat/v0.2-vanilla-chest` (not yet merged to main).  
 v0.1.1 is on `main`. Do not merge until in-game testing passes (see QUESTIONS.md).
 
+## Git workflow
+- **Always work in a feature branch** (`feat/v0.2-vanilla-chest`, `fix/break-handler`, etc.)
+- **Never commit directly to `main`**
+- Merge to `main` only after in-game testing passes
+- Branch naming: `feat/`, `fix/`, `docs/` prefixes
+- Keep commits atomic with clear messages
+
 ## Tech stack
 - `@minecraft/server` **stable 1.16.0** (not beta)
 - Target: Bedrock 1.21.50+ (tested on 1.26.1301.0)
